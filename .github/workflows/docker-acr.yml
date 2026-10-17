@@ -6,7 +6,7 @@ name: Build and Push Docker Image
 # ACR_REGISTRY 填公网域名（如 registry.cn-hangzhou.aliyuncs.com），不要填 registry-vpc。
 on:
   push:
-    branches: [main, ch]
+    branches: [dev]
     tags: ['v*']
 
 jobs:
@@ -39,7 +39,7 @@ jobs:
           tags: |
             type=raw,value={{date 'YYYYMMDD-HHmmss'}}
             type=sha,format=short
-            type=raw,value=ch,enable=${{ github.ref == 'refs/heads/ch' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=semver,pattern={{version}}
 
       # 多阶段构建的 bun / go 层不在最终镜像里，mode=max 才能在下次构建复用
