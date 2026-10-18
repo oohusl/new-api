@@ -20,6 +20,7 @@ const (
 	VerificationMethodPasskey            = "passkey"
 	VerificationMethodPassword           = "password"
 	VerificationMethodOAuth              = "oauth"
+	VerificationMethodSMS                = "sms"
 	VerificationMethodSession            = "session"
 	VerificationScopeChannelKeyRead      = "channel.key.read"
 	VerificationScopePasskeyRegister     = "passkey.register"
@@ -306,6 +307,8 @@ type VerificationRequirements struct {
 	Methods                   []VerificationMethodOption  `json:"methods"`
 	OAuthProviders            []VerificationOAuthProvider `json:"oauth_providers"`
 	PasswordEncryptionEnabled bool                        `json:"password_encryption_enabled"`
+	// Phone is the masked number a password-set SMS code is sent to.
+	Phone string `json:"phone,omitempty"`
 }
 
 // securityVerificationPolicy is the only operation-to-method policy. Device
@@ -343,6 +346,11 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 		if len(methods) == 0 {
 			if state.HasPassword {
 				methods = []string{VerificationMethodPassword}
+			} else if scope == VerificationScopePasswordSet && state.HasPhone {
+				// A phone-only account has no password, passkey, or linked
+				// OAuth identity. Setting the first password is confirmed
+				// with a code sent to the bound number.
+				methods = []string{VerificationMethodSMS}
 			} else {
 				methods = []string{VerificationMethodOAuth}
 			}
@@ -398,6 +406,23 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
 				methods[i].Available, methods[i].Reason = false, "Password authentication is disabled."
 			}
+		}
+		if methods[i].Method == VerificationMethodSMS {
+			if !common.AliyunSMS.Configured() {
+				methods[i].Available, methods[i].Reason = false, "SMS verification is not configured."
+				continue
+			}
+			user, err := model.GetUserById(identity.UserID, false)
+			if err != nil {
+				return nil, err
+			}
+			phone, phoneErr := NormalizeLoginPhone(userPhoneNumber(user))
+			if phoneErr != nil {
+				methods[i].Available, methods[i].Reason = false, "No mobile number is bound to this account."
+				continue
+			}
+			requirements.Phone = MaskLoginPhone(phone)
+			continue
 		}
 		if methods[i].Method != VerificationMethodOAuth {
 			continue
@@ -607,6 +632,18 @@ func VerifySecurityInput(identity AuthIdentity, input VerificationInput) (*Secur
 		}
 		if err := VerifyTwoFactorCode(twoFA, input.Code); err != nil {
 			return nil, err
+		}
+	case VerificationMethodSMS:
+		status, err := consumePasswordSetSMS(identity.UserID, input.Code)
+		if err != nil {
+			return nil, err
+		}
+		switch status {
+		case SMSCodeAccepted:
+		case SMSCodeLocked:
+			return nil, ErrSMSVerificationLocked
+		default:
+			return nil, ErrSMSVerificationRejected
 		}
 	case VerificationMethodPasskey, VerificationMethodOAuth:
 		return nil, ErrVerificationFlowRequired

@@ -84,6 +84,12 @@ func writeSecurityOperationError(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrVerificationForbidden):
 		status = http.StatusForbidden
 		code, message = "SECURITY_ACTION_FORBIDDEN", service.ErrVerificationForbidden.Error()
+	case errors.Is(err, service.ErrSMSVerificationRejected):
+		code, message = "SMS_CODE_INVALID", service.ErrSMSVerificationRejected.Error()
+	case errors.Is(err, service.ErrSMSVerificationLocked):
+		code, message = "SMS_CODE_LOCKED", service.ErrSMSVerificationLocked.Error()
+	case errors.Is(err, service.ErrSMSSendFailed):
+		code, message = "SMS_SEND_FAILED", service.ErrSMSSendFailed.Error()
 	case errors.Is(err, service.ErrVerificationFailed), errors.As(err, &protocolError):
 		code, message = "SECURITY_VERIFICATION_FAILED", service.ErrVerificationFailed.Error()
 	case errors.Is(err, service.ErrVerificationLocked):
@@ -172,4 +178,23 @@ func UniversalVerify(c *gin.Context) {
 	}
 	recordUserSecurityAudit(c, identity.UserID, "user.security_verify", map[string]any{"method": proof.Method, "scope": proof.Scope})
 	common.ApiSuccess(c, proof)
+}
+
+// SendPasswordSetSMS texts a verification code to the signed-in user's phone
+// so a phone-only account can set its first password.
+func SendPasswordSetSMS(c *gin.Context) {
+	identity, ok := middleware.GetStepUpIdentity(c)
+	if !ok {
+		writeAccountStatusError(c, http.StatusUnauthorized, "The current sign-in method does not support security verification")
+		return
+	}
+	phone, retryAfter, err := service.SendPasswordSetSMS(c.Request.Context(), identity)
+	if err != nil {
+		if writeSMSLoginLimit(c, err) {
+			return
+		}
+		writeSecurityOperationError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"phone": phone, "retry_after": retryAfter})
 }

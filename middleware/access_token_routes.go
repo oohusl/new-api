@@ -56,6 +56,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/oauth/telegram/bind/start": accessTokenSessionRule,
 	"GET /api/oauth/:provider":            accessTokenSessionRule,
 	"GET /api/verify/methods":             accessTokenAnyRule,
+	"POST /api/verify/sms/send":           accessTokenAnyRule,
 	"POST /api/verify":                    accessTokenAnyRule,
 
 	// router/api-router.go: /api/user (self)
