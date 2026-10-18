@@ -2,11 +2,13 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/require"
@@ -65,6 +67,42 @@ func TestMemorySMSLoginCodeIsSingleUseAndLocks(t *testing.T) {
 	status, err = ConsumeSMSLoginCode("13800138001", "654321")
 	require.NoError(t, err)
 	require.Equal(t, SMSCodeMismatch, status)
+}
+
+func TestSMSLoginSendAndVerifyCaps(t *testing.T) {
+	previousRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	ResetSMSLoginMemoryForTest()
+	t.Cleanup(func() {
+		common.RedisEnabled = previousRedis
+		ResetSMSLoginMemoryForTest()
+	})
+
+	start := time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC)
+	require.NoError(t, reserveSMSLoginSend("13800138000", "192.0.2.10", start))
+	err := reserveSMSLoginSend("13800138000", "192.0.2.10", start.Add(time.Second))
+	var limit *SMSLoginLimit
+	require.ErrorAs(t, err, &limit)
+	require.GreaterOrEqual(t, limit.RetryAfterSeconds, 59)
+
+	for i := 1; i < smsLoginIPMinuteLimit; i++ {
+		require.NoError(t, reserveSMSLoginSend(fmt.Sprintf("1380013%04d", i), "192.0.2.10", start))
+	}
+	err = reserveSMSLoginSend("13800139999", "192.0.2.10", start)
+	require.ErrorAs(t, err, &limit)
+
+	for i := 0; i < smsLoginPhoneHourLimit; i++ {
+		require.NoError(t, reserveSMSLoginSend("13800138111", fmt.Sprintf("192.0.2.%d", 20+i), start.Add(time.Duration(i)*time.Minute)))
+	}
+	err = reserveSMSLoginSend("13800138111", "192.0.2.40", start.Add(5*time.Minute))
+	require.ErrorAs(t, err, &limit)
+
+	for i := 0; i < smsLoginVerifyPhoneLimit; i++ {
+		require.NoError(t, reserveSMSLoginVerify("13800138222", "192.0.2.50", start))
+	}
+	err = reserveSMSLoginVerify("13800138222", "192.0.2.50", start)
+	require.ErrorAs(t, err, &limit)
+	require.NoError(t, reserveSMSLoginVerify("13800138223", "192.0.2.51", start))
 }
 
 func TestAliyunSMSPostsSignedSendSms(t *testing.T) {

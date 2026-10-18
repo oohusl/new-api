@@ -42,13 +42,7 @@ func SendSMSLoginCode(c *gin.Context) {
 		return
 	}
 	if err := service.ReserveSMSLoginSend(phone, c.ClientIP()); err != nil {
-		var limit *service.SMSLoginLimit
-		if errors.As(err, &limit) {
-			seconds := limit.RetryAfterSeconds
-			if seconds < 1 {
-				seconds = 1
-			}
-			common.ApiErrorT(c, "Please wait {{seconds}} seconds before requesting another verification code.", map[string]any{"seconds": seconds})
+		if writeSMSLoginLimit(c, err) {
 			return
 		}
 		common.SysLog(common.LogText("sms login reserve failed for %s: %s", service.MaskLoginPhone(phone), err.Error()))
@@ -69,7 +63,6 @@ func SendSMSLoginCode(c *gin.Context) {
 	}
 	if err := service.SendAliyunLoginCode(c.Request.Context(), phone, code); err != nil {
 		service.DeleteSMSLoginCode(phone)
-		service.ReleaseSMSLoginCooldown(phone)
 		common.SysLog(common.LogText("sms login send failed for %s: %s", service.MaskLoginPhone(phone), err.Error()))
 		common.ApiErrorT(c, "Failed to send verification code")
 		return
@@ -92,6 +85,14 @@ func SMSLogin(c *gin.Context) {
 	phone, err := service.NormalizeLoginPhone(request.Phone)
 	if err != nil {
 		common.ApiErrorT(c, "Please enter a valid mobile number")
+		return
+	}
+	if err := service.ReserveSMSLoginVerify(phone, c.ClientIP()); err != nil {
+		if writeSMSLoginLimit(c, err) {
+			return
+		}
+		common.SysLog(common.LogText("sms login verify reserve failed for %s: %s", service.MaskLoginPhone(phone), err.Error()))
+		common.ApiErrorT(c, "Verification code is incorrect or has expired")
 		return
 	}
 	code := strings.TrimSpace(request.Code)
@@ -121,6 +122,19 @@ func SMSLogin(c *gin.Context) {
 	}
 	c.Set("login_method", "sms")
 	setupLogin(user, nil, c)
+}
+
+func writeSMSLoginLimit(c *gin.Context, err error) bool {
+	var limit *service.SMSLoginLimit
+	if !errors.As(err, &limit) {
+		return false
+	}
+	seconds := limit.RetryAfterSeconds
+	if seconds < 1 {
+		seconds = 1
+	}
+	common.ApiErrorT(c, "Please wait {{seconds}} seconds before requesting another verification code.", map[string]any{"seconds": seconds})
+	return true
 }
 
 func smsLoginUser(c *gin.Context, phone, affCode string) (*model.User, error) {

@@ -14,24 +14,39 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-
-	"github.com/go-redis/redis/v8"
 )
 
 const (
-	smsLoginCodeTTL         = 5 * time.Minute
-	smsLoginCooldown        = 60 * time.Second
-	smsLoginDailyWindow     = 24 * time.Hour
-	smsLoginIPWindow        = time.Hour
-	smsLoginCodeDigits      = 6
-	smsLoginMaxAttempts     = 5
-	smsLoginDailyPhoneLimit = 10
-	smsLoginHourlyIPLimit   = 20
+	smsLoginCodeTTL           = 5 * time.Minute
+	smsLoginCooldown          = 60 * time.Second
+	smsLoginPhoneHourWindow   = time.Hour
+	smsLoginDailyWindow       = 24 * time.Hour
+	smsLoginIPMinuteWindow    = time.Minute
+	smsLoginIPWindow          = time.Hour
+	smsLoginIPDayWindow       = 24 * time.Hour
+	smsLoginGlobalWindow      = time.Minute
+	smsLoginVerifyWindow      = 10 * time.Minute
+	smsLoginCodeDigits        = 6
+	smsLoginMaxAttempts       = 5
+	smsLoginPhoneHourLimit    = 5
+	smsLoginDailyPhoneLimit   = 10
+	smsLoginIPMinuteLimit     = 5
+	smsLoginHourlyIPLimit     = 20
+	smsLoginIPDayLimit        = 50
+	smsLoginGlobalMinuteLimit = 20
+	smsLoginVerifyPhoneLimit  = 10
+	smsLoginVerifyIPLimit     = 40
 
-	smsLoginCodeKeyPrefix     = "sms:login:code:"
-	smsLoginCooldownKeyPrefix = "sms:login:cool:"
-	smsLoginDailyKeyPrefix    = "sms:login:day:"
-	smsLoginIPKeyPrefix       = "sms:login:ip:"
+	smsLoginCodeKeyPrefix      = "sms:login:code:"
+	smsLoginCooldownKeyPrefix  = "sms:login:cool:"
+	smsLoginPhoneHourKeyPrefix = "sms:login:ph:"
+	smsLoginDailyKeyPrefix     = "sms:login:day:"
+	smsLoginIPMinuteKeyPrefix  = "sms:login:ipm:"
+	smsLoginIPKeyPrefix        = "sms:login:ip:"
+	smsLoginIPDayKeyPrefix     = "sms:login:ipd:"
+	smsLoginGlobalKey          = "sms:login:global"
+	smsLoginVerifyPhonePrefix  = "sms:login:vphone:"
+	smsLoginVerifyIPPrefix     = "sms:login:vip:"
 )
 
 var (
@@ -86,12 +101,38 @@ func MaskLoginPhone(phone string) string {
 	return phone[:3] + "****" + phone[len(phone)-4:]
 }
 
-// ReserveSMSLoginSend applies the per-phone cooldown, daily cap, and per-IP cap.
+// ReserveSMSLoginSend applies the phone, IP, and global send caps atomically.
+// A burst of concurrent calls cannot pass a check before any of them is counted.
 func ReserveSMSLoginSend(phone, ip string) error {
+	return reserveSMSLoginSend(phone, smsLimitIP(ip), time.Now())
+}
+
+func reserveSMSLoginSend(phone, ip string, now time.Time) error {
 	if common.RedisEnabled {
 		return reserveSMSLoginSendRedis(phone, ip)
 	}
-	return smsLoginMemory.reserve(phone, ip, time.Now())
+	return smsLoginMemory.reserve(phone, ip, now)
+}
+
+// ReserveSMSLoginVerify counts a code check before the code is compared.
+// Calls with a missing or malformed code consume the same budget.
+func ReserveSMSLoginVerify(phone, ip string) error {
+	return reserveSMSLoginVerify(phone, smsLimitIP(ip), time.Now())
+}
+
+func reserveSMSLoginVerify(phone, ip string, now time.Time) error {
+	if common.RedisEnabled {
+		return reserveSMSLoginVerifyRedis(phone, ip)
+	}
+	return smsLoginMemory.reserveVerify(phone, ip, now)
+}
+
+func smsLimitIP(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return "unknown"
+	}
+	return ip
 }
 
 func SaveSMSLoginCode(phone, code string) error {
@@ -137,85 +178,189 @@ func ConsumeSMSLoginCode(phone, code string) (SMSCodeStatus, error) {
 	return smsLoginMemory.consume(phone, code, time.Now()), nil
 }
 
-func reserveSMSLoginSendRedis(phone, ip string) error {
-	ctx := context.Background()
-	coolKey := smsLoginCooldownKeyPrefix + phone
-	ttl, err := common.RDB.PTTL(ctx, coolKey).Result()
-	if err != nil {
-		return err
-	}
-	if ttl > 0 {
-		return &SMSLoginLimit{RetryAfterSeconds: secondsCeil(ttl)}
-	}
-	if retry, err := redisOverLimit(ctx, smsLoginDailyKeyPrefix+phone, smsLoginDailyPhoneLimit); err != nil {
-		return err
-	} else if retry > 0 {
-		return &SMSLoginLimit{RetryAfterSeconds: retry}
-	}
-	if retry, err := redisOverLimit(ctx, smsLoginIPKeyPrefix+ip, smsLoginHourlyIPLimit); err != nil {
-		return err
-	} else if retry > 0 {
-		return &SMSLoginLimit{RetryAfterSeconds: retry}
-	}
+// smsLimitTakeScript increments every window, then rolls all of them back when
+// any window is already full. Redis runs the script atomically, so concurrent
+// callers cannot all observe a stale count and send together.
+const smsLimitTakeScript = `
+local function take(key, limit, windowMs)
+  local n = redis.call('INCR', key)
+  if n == 1 then
+    redis.call('PEXPIRE', key, windowMs)
+  end
+  local ttl = redis.call('PTTL', key)
+  if ttl < 1 then
+    redis.call('PEXPIRE', key, windowMs)
+    ttl = tonumber(windowMs)
+  end
+  if n > tonumber(limit) then
+    return ttl
+  end
+  return 0
+end
 
-	ok, err := common.RDB.SetNX(ctx, coolKey, "1", smsLoginCooldown).Result()
+local function rollback(keys)
+  for i = 1, #keys do
+    redis.call('DECR', keys[i])
+  end
+end
+
+local coolTTL = redis.call('PTTL', KEYS[1])
+if coolTTL > 0 then
+  return {0, coolTTL}
+end
+
+local specs = {
+  {KEYS[2], ARGV[2], ARGV[3]},
+  {KEYS[3], ARGV[4], ARGV[5]},
+  {KEYS[4], ARGV[6], ARGV[7]},
+  {KEYS[5], ARGV[8], ARGV[9]},
+  {KEYS[6], ARGV[10], ARGV[11]},
+  {KEYS[7], ARGV[12], ARGV[13]}
+}
+local touched = {}
+local reject = 0
+for i = 1, #specs do
+  local ttl = take(specs[i][1], specs[i][2], specs[i][3])
+  touched[i] = specs[i][1]
+  if ttl > 0 and (reject == 0 or ttl < reject) then
+    reject = ttl
+  end
+end
+if reject > 0 then
+  rollback(touched)
+  return {0, reject}
+end
+
+local ok = redis.call('SET', KEYS[1], '1', 'PX', ARGV[1], 'NX')
+if not ok then
+  rollback(touched)
+  local ttl = redis.call('PTTL', KEYS[1])
+  if ttl < 1 then
+    ttl = 1000
+  end
+  return {0, ttl}
+end
+return {1, 0}
+`
+
+const smsVerifyTakeScript = `
+local function take(key, limit, windowMs)
+  local n = redis.call('INCR', key)
+  if n == 1 then
+    redis.call('PEXPIRE', key, windowMs)
+  end
+  local ttl = redis.call('PTTL', key)
+  if ttl < 1 then
+    redis.call('PEXPIRE', key, windowMs)
+    ttl = tonumber(windowMs)
+  end
+  if n > tonumber(limit) then
+    return ttl
+  end
+  return 0
+end
+
+local phoneTTL = take(KEYS[1], ARGV[1], ARGV[2])
+local ipTTL = take(KEYS[2], ARGV[3], ARGV[4])
+if phoneTTL > 0 or ipTTL > 0 then
+  redis.call('DECR', KEYS[1])
+  redis.call('DECR', KEYS[2])
+  local retry = phoneTTL
+  if ipTTL > 0 and (retry == 0 or ipTTL < retry) then
+    retry = ipTTL
+  end
+  if retry < 1 then
+    retry = 1000
+  end
+  return {0, retry}
+end
+return {1, 0}
+`
+
+func reserveSMSLoginSendRedis(phone, ip string) error {
+	values, err := common.RDB.Eval(
+		context.Background(),
+		smsLimitTakeScript,
+		[]string{
+			smsLoginCooldownKeyPrefix + phone,
+			smsLoginPhoneHourKeyPrefix + phone,
+			smsLoginDailyKeyPrefix + phone,
+			smsLoginIPMinuteKeyPrefix + ip,
+			smsLoginIPKeyPrefix + ip,
+			smsLoginIPDayKeyPrefix + ip,
+			smsLoginGlobalKey,
+		},
+		smsLoginCooldown.Milliseconds(),
+		smsLoginPhoneHourLimit,
+		smsLoginPhoneHourWindow.Milliseconds(),
+		smsLoginDailyPhoneLimit,
+		smsLoginDailyWindow.Milliseconds(),
+		smsLoginIPMinuteLimit,
+		smsLoginIPMinuteWindow.Milliseconds(),
+		smsLoginHourlyIPLimit,
+		smsLoginIPWindow.Milliseconds(),
+		smsLoginIPDayLimit,
+		smsLoginIPDayWindow.Milliseconds(),
+		smsLoginGlobalMinuteLimit,
+		smsLoginGlobalWindow.Milliseconds(),
+	).Slice()
 	if err != nil {
 		return err
 	}
-	if !ok {
-		ttl, err = common.RDB.PTTL(ctx, coolKey).Result()
-		if err != nil {
-			return err
-		}
-		retry := secondsCeil(ttl)
-		if retry < 1 {
-			retry = 1
-		}
-		return &SMSLoginLimit{RetryAfterSeconds: retry}
-	}
-	if err := redisIncrementWindow(ctx, smsLoginDailyKeyPrefix+phone, smsLoginDailyWindow); err != nil {
-		_ = common.RDB.Del(ctx, coolKey).Err()
-		return err
-	}
-	if err := redisIncrementWindow(ctx, smsLoginIPKeyPrefix+ip, smsLoginIPWindow); err != nil {
-		_ = common.RDB.Del(ctx, coolKey).Err()
-		return err
-	}
-	return nil
+	return smsLimitResult(values)
 }
 
-func redisOverLimit(ctx context.Context, key string, limit int) (int, error) {
-	count, err := common.RDB.Get(ctx, key).Result()
-	if errors.Is(err, redis.Nil) {
-		return 0, nil
-	}
+func reserveSMSLoginVerifyRedis(phone, ip string) error {
+	values, err := common.RDB.Eval(
+		context.Background(),
+		smsVerifyTakeScript,
+		[]string{smsLoginVerifyPhonePrefix + phone, smsLoginVerifyIPPrefix + ip},
+		smsLoginVerifyPhoneLimit,
+		smsLoginVerifyWindow.Milliseconds(),
+		smsLoginVerifyIPLimit,
+		smsLoginVerifyWindow.Milliseconds(),
+	).Slice()
 	if err != nil {
-		return 0, err
+		return err
 	}
-	current, err := strconv.Atoi(count)
-	if err != nil || current < limit {
-		return 0, nil
+	return smsLimitResult(values)
+}
+
+func smsLimitResult(values []any) error {
+	if len(values) != 2 {
+		return fmt.Errorf("unexpected sms limit reply length %d", len(values))
 	}
-	ttl, err := common.RDB.PTTL(ctx, key).Result()
+	status, err := redisInteger(values[0])
 	if err != nil {
-		return 0, err
+		return err
 	}
-	retry := secondsCeil(ttl)
+	if status == 1 {
+		return nil
+	}
+	retryMs, err := redisInteger(values[1])
+	if err != nil {
+		return err
+	}
+	retry := secondsCeil(time.Duration(retryMs) * time.Millisecond)
 	if retry < 1 {
 		retry = 1
 	}
-	return retry, nil
+	return &SMSLoginLimit{RetryAfterSeconds: retry}
 }
 
-func redisIncrementWindow(ctx context.Context, key string, window time.Duration) error {
-	count, err := common.RDB.Incr(ctx, key).Result()
-	if err != nil {
-		return err
+func redisInteger(value any) (int64, error) {
+	switch typed := value.(type) {
+	case int64:
+		return typed, nil
+	case int:
+		return int64(typed), nil
+	case string:
+		return strconv.ParseInt(typed, 10, 64)
+	case []byte:
+		return strconv.ParseInt(string(typed), 10, 64)
+	default:
+		return 0, fmt.Errorf("unexpected redis integer type %T", value)
 	}
-	if count == 1 {
-		return common.RDB.Expire(ctx, key, window).Err()
-	}
-	return nil
 }
 
 func consumeSMSLoginCodeRedis(phone, code string) (SMSCodeStatus, error) {
@@ -278,8 +423,7 @@ type memorySMSLoginStore struct {
 	mu       sync.Mutex
 	codes    map[string]smsCodeEntry
 	cooldown map[string]time.Time
-	daily    map[string]smsCounter
-	ip       map[string]smsCounter
+	windows  map[string]smsCounter
 }
 
 type smsCodeEntry struct {
@@ -297,8 +441,7 @@ func newMemorySMSLoginStore() *memorySMSLoginStore {
 	return &memorySMSLoginStore{
 		codes:    map[string]smsCodeEntry{},
 		cooldown: map[string]time.Time{},
-		daily:    map[string]smsCounter{},
-		ip:       map[string]smsCounter{},
+		windows:  map[string]smsCounter{},
 	}
 }
 
@@ -308,15 +451,49 @@ func (store *memorySMSLoginStore) reserve(phone, ip string, now time.Time) error
 	if until, ok := store.cooldown[phone]; ok && until.After(now) {
 		return &SMSLoginLimit{RetryAfterSeconds: secondsCeil(until.Sub(now))}
 	}
-	if retry := counterRetry(store.daily, phone, smsLoginDailyPhoneLimit, now); retry > 0 {
-		return &SMSLoginLimit{RetryAfterSeconds: retry}
+	windows := []struct {
+		key    string
+		limit  int
+		window time.Duration
+	}{
+		{"ph:" + phone, smsLoginPhoneHourLimit, smsLoginPhoneHourWindow},
+		{"pd:" + phone, smsLoginDailyPhoneLimit, smsLoginDailyWindow},
+		{"im:" + ip, smsLoginIPMinuteLimit, smsLoginIPMinuteWindow},
+		{"ih:" + ip, smsLoginHourlyIPLimit, smsLoginIPWindow},
+		{"id:" + ip, smsLoginIPDayLimit, smsLoginIPDayWindow},
+		{"g", smsLoginGlobalMinuteLimit, smsLoginGlobalWindow},
 	}
-	if retry := counterRetry(store.ip, ip, smsLoginHourlyIPLimit, now); retry > 0 {
-		return &SMSLoginLimit{RetryAfterSeconds: retry}
+	for _, window := range windows {
+		if retry := counterRetry(store.windows, window.key, window.limit, now); retry > 0 {
+			return &SMSLoginLimit{RetryAfterSeconds: retry}
+		}
 	}
 	store.cooldown[phone] = now.Add(smsLoginCooldown)
-	incrementCounter(store.daily, phone, now, smsLoginDailyWindow)
-	incrementCounter(store.ip, ip, now, smsLoginIPWindow)
+	for _, window := range windows {
+		incrementCounter(store.windows, window.key, now, window.window)
+	}
+	return nil
+}
+
+func (store *memorySMSLoginStore) reserveVerify(phone, ip string, now time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	windows := []struct {
+		key    string
+		limit  int
+		window time.Duration
+	}{
+		{"vp:" + phone, smsLoginVerifyPhoneLimit, smsLoginVerifyWindow},
+		{"vi:" + ip, smsLoginVerifyIPLimit, smsLoginVerifyWindow},
+	}
+	for _, window := range windows {
+		if retry := counterRetry(store.windows, window.key, window.limit, now); retry > 0 {
+			return &SMSLoginLimit{RetryAfterSeconds: retry}
+		}
+	}
+	for _, window := range windows {
+		incrementCounter(store.windows, window.key, now, window.window)
+	}
 	return nil
 }
 
@@ -384,6 +561,5 @@ func ResetSMSLoginMemoryForTest() {
 	defer smsLoginMemory.mu.Unlock()
 	smsLoginMemory.codes = map[string]smsCodeEntry{}
 	smsLoginMemory.cooldown = map[string]time.Time{}
-	smsLoginMemory.daily = map[string]smsCounter{}
-	smsLoginMemory.ip = map[string]smsCounter{}
+	smsLoginMemory.windows = map[string]smsCounter{}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -78,6 +79,21 @@ func TestSMSLoginRejectsUnknownCodeAndDeletedPhone(t *testing.T) {
 	require.Contains(t, deleted.Body.String(), "User has been deleted")
 	require.NoError(t, db.Model(&model.User{}).Count(&count).Error)
 	require.Zero(t, count)
+}
+
+func TestSMSLoginVerifyRateLimitCountsMalformedCodes(t *testing.T) {
+	setupSMSLoginTest(t)
+	gin.SetMode(gin.TestMode)
+	blocked := false
+	for range 15 {
+		recorder := postSMSLogin(t, `{"phone":"13800138000","code":"1"}`)
+		if strings.Contains(recorder.Body.String(), "Please wait") {
+			blocked = true
+			break
+		}
+		require.Contains(t, recorder.Body.String(), "Verification code is incorrect or has expired")
+	}
+	require.True(t, blocked)
 }
 
 func TestSMSLoginRejectsAdminOrigin(t *testing.T) {
