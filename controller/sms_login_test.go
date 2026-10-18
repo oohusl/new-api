@@ -81,6 +81,20 @@ func TestSMSLoginRejectsUnknownCodeAndDeletedPhone(t *testing.T) {
 	require.Zero(t, count)
 }
 
+func TestSendSMSLoginCodeRequiresSlider(t *testing.T) {
+	setupSMSLoginTest(t)
+	gin.SetMode(gin.TestMode)
+	service.ResetSMSCaptchaForTest()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/user/login/sms/code", bytes.NewBufferString(`{"phone":"13800138000"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Origin", "https://www.chroneb.cn")
+	c.Request.RemoteAddr = "192.0.2.8:1234"
+	SendSMSLoginCode(c)
+	require.Contains(t, recorder.Body.String(), "Please complete the slider verification")
+}
+
 func TestSMSLoginVerifyRateLimitCountsMalformedCodes(t *testing.T) {
 	setupSMSLoginTest(t)
 	gin.SetMode(gin.TestMode)

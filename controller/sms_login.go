@@ -18,13 +18,45 @@ import (
 )
 
 type smsCodeRequest struct {
-	Phone string `json:"phone"`
+	Phone        string                    `json:"phone"`
+	CaptchaToken string                    `json:"captcha_token"`
+	CaptchaX     *int                      `json:"captcha_x"`
+	CaptchaTrack []service.SMSCaptchaPoint `json:"captcha_track"`
 }
 
 type smsLoginRequest struct {
 	Phone   string `json:"phone"`
 	Code    string `json:"code"`
 	AffCode string `json:"aff_code"`
+}
+
+func IssueSMSLoginCaptcha(c *gin.Context) {
+	if !middleware.AllowSMSLogin(c) {
+		return
+	}
+	challenge, err := service.IssueSMSCaptcha(c.ClientIP())
+	if err != nil {
+		if writeSMSLoginLimit(c, err) {
+			return
+		}
+		common.SysLog(common.LogText("sms captcha issue failed: %s", err.Error()))
+		common.ApiErrorT(c, "Please complete the slider verification")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"token":        challenge.Token,
+			"background":   challenge.Background,
+			"piece":        challenge.Piece,
+			"width":        challenge.Width,
+			"height":       challenge.Height,
+			"piece_width":  challenge.PieceWidth,
+			"piece_height": challenge.PieceHeight,
+			"piece_y":      challenge.PieceY,
+		},
+	})
 }
 
 func SendSMSLoginCode(c *gin.Context) {
@@ -39,6 +71,17 @@ func SendSMSLoginCode(c *gin.Context) {
 	phone, err := service.NormalizeLoginPhone(request.Phone)
 	if err != nil {
 		common.ApiErrorT(c, "Please enter a valid mobile number")
+		return
+	}
+	captchaX := -1
+	if request.CaptchaX != nil {
+		captchaX = *request.CaptchaX
+	}
+	if err := service.VerifySMSCaptcha(c.ClientIP(), request.CaptchaToken, captchaX, request.CaptchaTrack); err != nil {
+		if writeSMSLoginLimit(c, err) {
+			return
+		}
+		common.ApiErrorT(c, "Please complete the slider verification")
 		return
 	}
 	if err := service.ReserveSMSLoginSend(phone, c.ClientIP()); err != nil {
