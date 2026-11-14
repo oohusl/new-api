@@ -60,7 +60,7 @@ func TestResendDeliversThroughSelectedProvider(t *testing.T) {
 			HTML    string   `json:"html"`
 		}
 		require.NoError(t, common.DecodeJson(request.Body, &body))
-		assert.Equal(t, `"New API" <sender@example.com>`, body.From)
+		assert.Equal(t, `"Chroneb" <sender@example.com>`, body.From)
 		assert.Equal(t, []string{"one@example.com", "two@example.com"}, body.To)
 		assert.Equal(t, "验证码", body.Subject)
 		assert.Equal(t, "<p>123456</p>", body.HTML)

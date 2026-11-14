@@ -78,7 +78,7 @@ func resolveUserSortOptions(sortOptions []UserSortOptions) UserSortOptions {
 // Otherwise, the sensitive information will be saved on local storage in plain text!
 type User struct {
 	Id                   int                        `json:"id"`
-	Username             string                     `json:"username" gorm:"unique;index" validate:"max=20"`
+	Username             string                     `json:"username" gorm:"unique;index" validate:"max=50"`
 	Password             string                     `json:"password" gorm:"not null;" validate:"min=8,max=128"`
 	HasPassword          bool                       `json:"-" gorm:"-:all"`
 	OriginalPassword     string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
@@ -1065,8 +1065,8 @@ func (user *User) ValidateAndFill() (err error) {
 	if username == "" || password == "" {
 		return ErrUserEmptyCredentials
 	}
-	// find by username or email
-	err = DB.Where("username = ? OR email = ?", username, username).First(user).Error
+	// find by username or email. Stored emails are lowercase.
+	err = DB.Where("username = ? OR LOWER(email) = ?", username, strings.ToLower(username)).First(user).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrInvalidCredentials

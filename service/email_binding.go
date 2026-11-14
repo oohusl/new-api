@@ -179,7 +179,7 @@ func generateEmailBindingCodes(requireOld bool) (emailBindingCodes, error) {
 }
 
 func sendEmailBindingCodes(lang string, state model.EmailBindingState, codes emailBindingCodes) error {
-	subject := i18n.Translate(lang, i18n.MsgEmailBindingSubject, map[string]any{"SystemName": common.SystemName})
+	subject := i18n.Translate(lang, i18n.MsgEmailBindingSubject, map[string]any{"SystemName": common.EmailBrandName})
 	minutes := map[string]any{"Minutes": int(model.EmailBindingTTL / time.Minute)}
 	content := fmt.Sprintf("<p>%s</p><p>%s</p><p>%s</p>",
 		i18n.Translate(lang, i18n.MsgEmailBindingNewIntro),

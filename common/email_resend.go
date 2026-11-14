@@ -43,8 +43,8 @@ func sendResendEmail(apiKey, from, subject, receiver, content string) error {
 	}
 	apiKey = strings.TrimSpace(apiKey)
 	sender, _ := mail.ParseAddress(strings.TrimSpace(from))
-	if sender.Name == "" {
-		sender.Name = SystemName
+	if sender.Name == "" || strings.EqualFold(strings.TrimSpace(sender.Name), "New API") {
+		sender.Name = EmailBrandName
 	}
 	to := make([]string, 0)
 	for address := range strings.SplitSeq(receiver, ";") {

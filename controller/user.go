@@ -232,8 +232,19 @@ func Register(c *gin.Context) {
 		return
 	}
 	user.Username = strings.TrimSpace(user.Username)
-	user.Email = model.NormalizeEmail(user.Email)
-	if user.Username == "" {
+	if strings.TrimSpace(user.Email) != "" {
+		email, emailErr := service.ValidateAccountEmail(user.Email)
+		if emailErr != nil {
+			common.ApiErrorT(c, emailErr.Error())
+			return
+		}
+		user.Email = email
+	} else {
+		user.Email = ""
+	}
+	if user.Email != "" {
+		user.Username = user.Email
+	} else if user.Username == "" || common.Validate.Var(user.Username, "max=20") != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -250,6 +261,8 @@ func Register(c *gin.Context) {
 			common.ApiErrorT(c, "Verification code is incorrect or has expired")
 			return
 		}
+	}
+	if user.Email != "" {
 		if err := model.EnsureEmailAvailable(user.Email, 0); err != nil {
 			if errors.Is(err, model.ErrEmailAlreadyTaken) {
 				common.ApiErrorT(c, "Email address is already in use")
@@ -259,10 +272,7 @@ func Register(c *gin.Context) {
 			return
 		}
 	}
-	emailForExistCheck := ""
-	if common.EmailVerificationEnabled {
-		emailForExistCheck = user.Email
-	}
+	emailForExistCheck := user.Email
 	exist, err := model.CheckUserExistOrDeleted(user.Username, emailForExistCheck)
 	if err != nil {
 		common.ApiErrorT(c, "Database error, please contact the administrator")
@@ -275,15 +285,17 @@ func Register(c *gin.Context) {
 	}
 	affCode := user.AffCode // this code is the inviter's code, not the user's own code
 	inviterId, _ := model.GetUserIdByAffCode(affCode)
+	displayName := user.Username
+	if user.Email != "" {
+		displayName = emailLocalDisplay(user.Email)
+	}
 	cleanUser := model.User{
 		Username:    user.Username,
 		Password:    user.Password,
-		DisplayName: user.Username,
+		DisplayName: displayName,
 		InviterId:   inviterId,
 		Role:        common.RoleCommonUser, // 明确设置角色为普通用户
-	}
-	if common.EmailVerificationEnabled {
-		cleanUser.Email = user.Email
+		Email:       user.Email,
 	}
 	if err := cleanUser.Insert(inviterId); err != nil {
 		if errors.Is(err, model.ErrEmailAlreadyTaken) {
@@ -311,7 +323,7 @@ func Register(c *gin.Context) {
 		// 生成默认令牌
 		token := model.Token{
 			UserId:             insertedUser.Id, // 使用插入后的用户ID
-			Name:               i18n.T(c, i18n.MsgUserDefaultTokenName, map[string]any{"Username": cleanUser.Username}),
+			Name:               i18n.T(c, i18n.MsgUserDefaultTokenName, map[string]any{"Username": cleanUser.DisplayName}),
 			Key:                key,
 			CreatedTime:        common.GetTimestamp(),
 			AccessedTime:       common.GetTimestamp(),

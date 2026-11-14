@@ -232,7 +232,7 @@ func SendEmailVerification(c *gin.Context) {
 	common.RegisterVerificationCodeWithKey(email, code, common.EmailVerificationPurpose)
 	// The address may not belong to an account yet, so the mail follows the
 	// request language.
-	systemName := map[string]any{"SystemName": common.SystemName}
+	systemName := map[string]any{"SystemName": common.EmailBrandName}
 	subject := i18n.T(c, i18n.MsgEmailVerificationSubject, systemName)
 	content := fmt.Sprintf("<p>%s</p>"+
 		"<p>%s</p>"+
@@ -266,7 +266,7 @@ func SendPasswordResetEmail(c *gin.Context) {
 		if lang == "" {
 			lang = i18n.StatedLang(c)
 		}
-		systemName := map[string]any{"SystemName": common.SystemName}
+		systemName := map[string]any{"SystemName": common.EmailBrandName}
 		linkParams := map[string]any{"Link": link}
 		subject := i18n.Translate(lang, i18n.MsgEmailPasswordResetSubject, systemName)
 		content := fmt.Sprintf("<p>%s</p>"+
